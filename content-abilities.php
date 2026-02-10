@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 if ( ! function_exists( 'wp_register_ability' ) ) {
 	add_action( 'admin_notices', function () {
-		echo '<div class="error notice"><p>';
+		echo '<div class="notice notice-error"><p>';
 		echo esc_html__( 'Content Abilities requires WordPress 6.9+ with the Abilities API.', 'content-abilities' );
 		echo '</p></div>';
 	} );

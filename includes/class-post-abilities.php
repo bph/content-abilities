@@ -10,6 +10,27 @@ namespace Content_Abilities;
 class Post_Abilities {
 
 	/**
+	 * Allowed post statuses for create operations.
+	 *
+	 * @var string[]
+	 */
+	private const CREATE_STATUSES = array( 'draft', 'publish', 'pending', 'private', 'future' );
+
+	/**
+	 * Allowed post statuses for update operations.
+	 *
+	 * @var string[]
+	 */
+	private const UPDATE_STATUSES = array( 'draft', 'publish', 'pending', 'private' );
+
+	/**
+	 * Allowed orderby values for find operations.
+	 *
+	 * @var string[]
+	 */
+	private const ALLOWED_ORDERBY = array( 'date', 'title', 'modified', 'ID' );
+
+	/**
 	 * Registers ability categories.
 	 */
 	public static function register_categories(): void {
@@ -68,7 +89,7 @@ class Post_Abilities {
 						'status'    => array(
 							'type'        => 'string',
 							'description' => __( 'Post status. Defaults to "draft".', 'content-abilities' ),
-							'enum'        => array( 'draft', 'publish', 'pending', 'private', 'future' ),
+							'enum'        => self::CREATE_STATUSES,
 							'default'     => 'draft',
 						),
 						'categories' => array(
@@ -86,22 +107,37 @@ class Post_Abilities {
 					),
 				),
 				'output_schema'       => self::post_output_schema(),
-				'permission_callback' => function ( $input = array() ): bool {
+				'permission_callback' => static function ( $input = array() ): bool {
 					$post_type = ! empty( $input['post_type'] ) ? sanitize_key( $input['post_type'] ) : 'post';
 					$pto       = get_post_type_object( $post_type );
-					if ( ! $pto ) {
+					if ( ! $pto || ! $pto->public ) {
 						return false;
 					}
-					return current_user_can( $pto->cap->create_posts ?? $pto->cap->edit_posts );
+					if ( ! current_user_can( $pto->cap->create_posts ?? $pto->cap->edit_posts ) ) {
+						return false;
+					}
+					$status = sanitize_key( $input['status'] ?? 'draft' );
+					if ( in_array( $status, array( 'publish', 'future' ), true ) && ! current_user_can( $pto->cap->publish_posts ) ) {
+						return false;
+					}
+					if ( 'private' === $status && ! current_user_can( $pto->cap->publish_posts ) ) {
+						return false;
+					}
+					return true;
 				},
-				'execute_callback'    => function ( $input = array() ) {
+				'execute_callback'    => static function ( $input = array() ) {
 					$post_type = ! empty( $input['post_type'] ) ? sanitize_key( $input['post_type'] ) : 'post';
 					$pto       = get_post_type_object( $post_type );
-					if ( ! $pto ) {
+					if ( ! $pto || ! $pto->public ) {
 						return new \WP_Error(
 							'content_invalid_post_type',
-							sprintf( __( 'Post type "%s" does not exist.', 'content-abilities' ), esc_html( $post_type ) )
+							sprintf( __( 'Post type "%s" is not available.', 'content-abilities' ), esc_html( $post_type ) )
 						);
+					}
+
+					$status = sanitize_key( $input['status'] ?? 'draft' );
+					if ( ! in_array( $status, self::CREATE_STATUSES, true ) ) {
+						$status = 'draft';
 					}
 
 					$postarr = array(
@@ -109,7 +145,7 @@ class Post_Abilities {
 						'post_title'   => sanitize_text_field( $input['title'] ),
 						'post_content' => wp_kses_post( $input['content'] ?? '' ),
 						'post_excerpt' => sanitize_textarea_field( $input['excerpt'] ?? '' ),
-						'post_status'  => sanitize_key( $input['status'] ?? 'draft' ),
+						'post_status'  => $status,
 					);
 
 					if ( ! empty( $input['categories'] ) && is_array( $input['categories'] ) ) {
@@ -122,7 +158,10 @@ class Post_Abilities {
 					}
 
 					if ( ! empty( $input['tags'] ) && is_array( $input['tags'] ) ) {
-						wp_set_post_tags( $post_id, $input['tags'] );
+						$tag_result = wp_set_post_tags( $post_id, $input['tags'] );
+						if ( is_wp_error( $tag_result ) ) {
+							return $tag_result;
+						}
 					}
 
 					$post = get_post( $post_id );
@@ -136,8 +175,9 @@ class Post_Abilities {
 					return self::format_post( $post );
 				},
 				'meta'                => array(
-					'mcp'         => array( 'public' => true ),
-					'annotations' => array(
+					'mcp'          => array( 'public' => true ),
+					'show_in_rest' => true,
+					'annotations'  => array(
 						'readOnlyHint'    => false,
 						'destructiveHint' => false,
 						'idempotentHint'  => false,
@@ -180,7 +220,7 @@ class Post_Abilities {
 						'status'  => array(
 							'type'        => 'string',
 							'description' => __( 'New post status.', 'content-abilities' ),
-							'enum'        => array( 'draft', 'publish', 'pending', 'private' ),
+							'enum'        => self::UPDATE_STATUSES,
 						),
 						'categories' => array(
 							'type'        => 'array',
@@ -195,14 +235,27 @@ class Post_Abilities {
 					),
 				),
 				'output_schema'       => self::post_output_schema(),
-				'permission_callback' => function ( $input = array() ): bool {
+				'permission_callback' => static function ( $input = array() ): bool {
 					$post_id = isset( $input['id'] ) ? (int) $input['id'] : 0;
 					if ( $post_id <= 0 ) {
 						return false;
 					}
-					return current_user_can( 'edit_post', $post_id );
+					if ( ! current_user_can( 'edit_post', $post_id ) ) {
+						return false;
+					}
+					if ( isset( $input['status'] ) ) {
+						$status = sanitize_key( $input['status'] );
+						$post   = get_post( $post_id );
+						if ( $post && in_array( $status, array( 'publish', 'private' ), true ) ) {
+							$pto = get_post_type_object( $post->post_type );
+							if ( $pto && ! current_user_can( $pto->cap->publish_posts ) ) {
+								return false;
+							}
+						}
+					}
+					return true;
 				},
-				'execute_callback'    => function ( $input = array() ) {
+				'execute_callback'    => static function ( $input = array() ) {
 					$post_id = (int) $input['id'];
 					$post    = get_post( $post_id );
 
@@ -225,7 +278,10 @@ class Post_Abilities {
 						$postarr['post_excerpt'] = sanitize_textarea_field( $input['excerpt'] );
 					}
 					if ( isset( $input['status'] ) ) {
-						$postarr['post_status'] = sanitize_key( $input['status'] );
+						$status = sanitize_key( $input['status'] );
+						if ( in_array( $status, self::UPDATE_STATUSES, true ) ) {
+							$postarr['post_status'] = $status;
+						}
 					}
 					if ( isset( $input['categories'] ) && is_array( $input['categories'] ) ) {
 						$postarr['post_category'] = array_map( 'absint', $input['categories'] );
@@ -237,15 +293,19 @@ class Post_Abilities {
 					}
 
 					if ( isset( $input['tags'] ) && is_array( $input['tags'] ) ) {
-						wp_set_post_tags( $post_id, $input['tags'] );
+						$tag_result = wp_set_post_tags( $post_id, $input['tags'] );
+						if ( is_wp_error( $tag_result ) ) {
+							return $tag_result;
+						}
 					}
 
 					$updated_post = get_post( $post_id );
 					return self::format_post( $updated_post );
 				},
 				'meta'                => array(
-					'mcp'         => array( 'public' => true ),
-					'annotations' => array(
+					'mcp'          => array( 'public' => true ),
+					'show_in_rest' => true,
+					'annotations'  => array(
 						'readOnlyHint'    => false,
 						'destructiveHint' => false,
 						'idempotentHint'  => true,
@@ -276,14 +336,14 @@ class Post_Abilities {
 					),
 				),
 				'output_schema'       => self::post_output_schema(),
-				'permission_callback' => function ( $input = array() ): bool {
+				'permission_callback' => static function ( $input = array() ): bool {
 					$post_id = isset( $input['id'] ) ? (int) $input['id'] : 0;
 					if ( $post_id <= 0 ) {
 						return false;
 					}
 					return current_user_can( 'read_post', $post_id );
 				},
-				'execute_callback'    => function ( $input = array() ) {
+				'execute_callback'    => static function ( $input = array() ) {
 					$post_id = (int) $input['id'];
 					$post    = get_post( $post_id );
 
@@ -297,8 +357,9 @@ class Post_Abilities {
 					return self::format_post( $post );
 				},
 				'meta'                => array(
-					'mcp'         => array( 'public' => true ),
-					'annotations' => array(
+					'mcp'          => array( 'public' => true ),
+					'show_in_rest' => true,
+					'annotations'  => array(
 						'readOnlyHint'    => true,
 						'destructiveHint' => false,
 						'idempotentHint'  => true,
@@ -333,6 +394,7 @@ class Post_Abilities {
 						'post_status' => array(
 							'type'        => 'string',
 							'description' => __( 'Post status to filter by. Defaults to "publish".', 'content-abilities' ),
+							'enum'        => array( 'publish', 'draft', 'pending', 'private' ),
 							'default'     => 'publish',
 						),
 						'limit'       => array(
@@ -345,7 +407,7 @@ class Post_Abilities {
 						'orderby'     => array(
 							'type'        => 'string',
 							'description' => __( 'Field to order results by.', 'content-abilities' ),
-							'enum'        => array( 'date', 'title', 'modified', 'ID' ),
+							'enum'        => self::ALLOWED_ORDERBY,
 							'default'     => 'date',
 						),
 						'order'       => array(
@@ -360,15 +422,34 @@ class Post_Abilities {
 					'type'  => 'array',
 					'items' => self::post_output_schema(),
 				),
-				'permission_callback' => function (): bool {
+				'permission_callback' => static function (): bool {
 					return current_user_can( 'read' );
 				},
-				'execute_callback'    => function ( $input = array() ) {
+				'execute_callback'    => static function ( $input = array() ) {
+					$post_type = sanitize_key( $input['post_type'] ?? 'post' );
+					$pto       = get_post_type_object( $post_type );
+					if ( ! $pto || ! $pto->public ) {
+						return new \WP_Error(
+							'content_invalid_post_type',
+							sprintf( __( 'Post type "%s" is not available.', 'content-abilities' ), esc_html( $post_type ) )
+						);
+					}
+
+					$status = sanitize_key( $input['post_status'] ?? 'publish' );
+					if ( ! in_array( $status, array( 'publish', 'draft', 'pending', 'private' ), true ) ) {
+						$status = 'publish';
+					}
+
+					$orderby = sanitize_key( $input['orderby'] ?? 'date' );
+					if ( ! in_array( $orderby, self::ALLOWED_ORDERBY, true ) ) {
+						$orderby = 'date';
+					}
+
 					$query_args = array(
-						'post_type'      => sanitize_key( $input['post_type'] ?? 'post' ),
-						'post_status'    => sanitize_key( $input['post_status'] ?? 'publish' ),
+						'post_type'      => $post_type,
+						'post_status'    => $status,
 						'posts_per_page' => min( absint( $input['limit'] ?? 10 ), 50 ),
-						'orderby'        => sanitize_key( $input['orderby'] ?? 'date' ),
+						'orderby'        => $orderby,
 						'order'          => strtoupper( sanitize_key( $input['order'] ?? 'DESC' ) ) === 'ASC' ? 'ASC' : 'DESC',
 					);
 
@@ -388,8 +469,9 @@ class Post_Abilities {
 					return $posts;
 				},
 				'meta'                => array(
-					'mcp'         => array( 'public' => true ),
-					'annotations' => array(
+					'mcp'          => array( 'public' => true ),
+					'show_in_rest' => true,
+					'annotations'  => array(
 						'readOnlyHint'    => true,
 						'destructiveHint' => false,
 						'idempotentHint'  => true,
